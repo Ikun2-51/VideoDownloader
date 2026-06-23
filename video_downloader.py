@@ -507,11 +507,17 @@ class VideoDownloaderApp:
                                       style="Small.TButton")
         self.export_btn.pack(side=tk.LEFT)
 
-        # FFmpeg 警告
+        # FFmpeg 警告 + 一键下载
         if not self.has_ffmpeg:
-            ttk.Label(bar, text="⚠ FFmpeg 未安装",
-                      style="Warning.TLabel", font=self.font_small).pack(
-                          side=tk.LEFT, padx=(PAD, 0))
+            self.ffmpeg_warn_frame = ttk.Frame(bar)
+            self.ffmpeg_warn_frame.pack(side=tk.LEFT, padx=(PAD, 0))
+            ttk.Label(self.ffmpeg_warn_frame, text="⚠ FFmpeg 未安装",
+                      style="Warning.TLabel", font=self.font_small).pack(side=tk.LEFT)
+            self.ffmpeg_dl_btn = ttk.Button(self.ffmpeg_warn_frame,
+                text="📥 一键安装",
+                command=self._install_ffmpeg,
+                style="Small.TButton")
+            self.ffmpeg_dl_btn.pack(side=tk.LEFT, padx=(PAD_TIGHT, 0))
 
         ttk.Separator(parent, orient=tk.HORIZONTAL).pack(
             fill=tk.X, pady=(PAD_STD, PAD_STD))
@@ -1734,6 +1740,42 @@ pyinstaller --onefile --windowed --name "VideoDownloader" --clean --collect-all 
             return f"{h}:{m:02d}:{s:02d}"
         return f"{m}:{s:02d}"
 
+    def _install_ffmpeg(self):
+        """一键安装 FFmpeg — 优先使用 winget，失败则打开下载页"""
+        import webbrowser
+
+        # 先尝试 winget（Windows 10/11 自带）
+        try:
+            self._update_status("📥  正在通过 winget 安装 FFmpeg...", "progress")
+            self.root.update()
+            result = subprocess.run(
+                ["winget", "install", "--id", "Gyan.FFmpeg", "--accept-source-agreements", "--accept-package-agreements"],
+                capture_output=True, text=True, timeout=120,
+            )
+            if result.returncode == 0:
+                # 刷新检测
+                self.has_ffmpeg = self._check_ffmpeg()
+                if self.has_ffmpeg:
+                    self._update_status("✅  FFmpeg 安装成功！", "success")
+                    # 隐藏警告
+                    if hasattr(self, 'ffmpeg_warn_frame'):
+                        self.ffmpeg_warn_frame.pack_forget()
+                    return
+        except Exception:
+            pass
+
+        # winget 失败 → 打开浏览器下载
+        self._update_status("📥  请在浏览器中下载 FFmpeg...", "info")
+        webbrowser.open("https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip")
+        messagebox.showinfo(
+            "安装 FFmpeg",
+            "1. 下载后解压 zip\n"
+            "2. 将 bin 文件夹路径添加到系统 PATH\n"
+            "3. 重启本应用\n\n"
+            "或复制 ffmpeg.exe 到:\n"
+            f"{os.path.expandvars(r'%LOCALAPPDATA%\\ffmpeg\\bin\\')}"
+        )
+
     @staticmethod
     def _check_ffmpeg():
         if shutil.which("ffmpeg"):
@@ -1742,8 +1784,13 @@ pyinstaller --onefile --windowed --name "VideoDownloader" --clean --collect-all 
             os.path.expandvars(r"%LOCALAPPDATA%\ffmpeg\bin\ffmpeg.exe"),
             os.path.expandvars(r"%ProgramFiles%\ffmpeg\bin\ffmpeg.exe"),
             r"C:\ffmpeg\bin\ffmpeg.exe",
+            r"C:\tools\ffmpeg\bin\ffmpeg.exe",
         ]:
             if os.path.isfile(p):
+                # 临时加到 os.environ PATH 以便 subprocess 能用
+                bin_dir = os.path.dirname(p)
+                if bin_dir not in os.environ.get("PATH", ""):
+                    os.environ["PATH"] = bin_dir + os.pathsep + os.environ.get("PATH", "")
                 return True
         try:
             subprocess.run(["ffmpeg", "-version"], capture_output=True, timeout=5)
