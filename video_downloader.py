@@ -1097,7 +1097,7 @@ pyinstaller --onefile --windowed --name "VideoDownloader" --clean --collect-all 
         if result["status"] == "ok":
             self._on_single_parsed(result["data"])
         else:
-            self._update_status(f"❌  解析失败: {result['data'][:60]}", "error")
+            self._handle_error("解析链接失败", result['data'])
 
     def _on_single_parsed(self, info: dict):
         """单视频解析成功 — 填充 UI"""
@@ -1598,14 +1598,8 @@ pyinstaller --onefile --windowed --name "VideoDownloader" --clean --collect-all 
         if task:
             task.status = "failed"
             msg = data.get("message", "未知错误")
-            if "Permission denied" in msg:
-                msg = "写入权限不足"
-            elif "No space" in msg:
-                msg = "磁盘空间不足"
-            elif "connection" in msg.lower():
-                msg = "网络连接中断"
             task.error_msg = msg
-            self._update_status(f"❌  失败: {msg}", "error")
+            self._handle_error("下载失败", msg)
         self._refresh_queue_ui()
         if self._batch_mode:
             self.root.after(300, self._process_next)
@@ -1691,6 +1685,84 @@ pyinstaller --onefile --windowed --name "VideoDownloader" --clean --collect-all 
             self.status_label.configure(text=text, foreground=color)
         except tk.TclError:
             pass
+
+    def _show_toast(self, title: str, message: str, duration_ms: int = 6000):
+        """弹出非阻塞通知气泡——不卡主界面，自动消失"""
+        t = self.theme
+        toast = tk.Toplevel(self.root)
+        toast.title("")
+        toast.overrideredirect(True)
+        toast.attributes("-topmost", True)
+        toast.configure(bg=t.bg_secondary)
+
+        toast.update_idletasks()
+        sw = toast.winfo_screenwidth()
+        sh = toast.winfo_screenheight()
+        tw, th = 400, 110
+        toast.geometry(f"{tw}x{th}+{sw-tw-PAD_STD}+{sh-th-60}")
+
+        border_frame = tk.Frame(toast, bg=t.accent, padx=2, pady=2)
+        border_frame.pack(fill=tk.BOTH, expand=True)
+        inner = tk.Frame(border_frame, bg=t.bg_secondary)
+        inner.pack(fill=tk.BOTH, expand=True)
+
+        title_label = tk.Label(inner, text=title, font=(FONT_UI, 11, "bold"),
+                                fg=t.text_primary, bg=t.bg_secondary, anchor="w")
+        title_label.pack(fill=tk.X, padx=PAD_STD, pady=(PAD_STD, 0))
+        msg_label = tk.Label(inner, text=message, font=self.font_small,
+                              fg=t.text_secondary, bg=t.bg_secondary,
+                              anchor="w", wraplength=tw-40, justify="left")
+        msg_label.pack(fill=tk.X, padx=PAD_STD, pady=(PAD_TIGHT, PAD_STD))
+
+        def _close(e=None):
+            toast.destroy()
+
+        toast.bind("<Button-1>", _close)
+        title_label.bind("<Button-1>", _close)
+        msg_label.bind("<Button-1>", _close)
+        toast.after(duration_ms, _close)
+
+    def _handle_error(self, context: str, error_msg: str):
+        """统一错误处理——分类显示 toast 或状态栏"""
+        err = error_msg.lower()
+
+        # Bilibili 412 问题
+        if "bilibili" in err and ("412" in err or "precondition" in err):
+            self._show_toast(
+                "⚠ Bilibili 访问受限 (412)",
+                "B站近期更新了反爬机制，yt-dlp 暂未适配。\n"
+                "临时方案：等待 yt-dlp 更新后重试\n"
+                "或使用浏览器 Cookie 登录后下载"
+            )
+            self._update_status("⚠ Bilibili 暂时无法访问，等待 yt-dlp 更新", "warning")
+            return
+
+        # 网络错误
+        if "connection" in err or "timeout" in err or "getaddrinfo" in err:
+            self._show_toast("网络错误", "请检查网络连接后重试")
+            self._update_status("❌ 网络连接失败", "error")
+            return
+
+        # 404
+        if "404" in err or "not found" in err:
+            self._update_status("❌ 视频未找到或已下架", "error")
+            return
+
+        # 不支持的 URL
+        if "unsupported" in err:
+            self._update_status("❌ 不支持的链接格式", "error")
+            return
+
+        # 权限/磁盘
+        if "permission" in err or "denied" in err:
+            self._show_toast("写入失败", "请检查保存路径权限或更换位置")
+            self._update_status("❌ 写入权限不足", "error")
+            return
+
+        # 默认
+        short = error_msg[:80]
+        self._show_toast(f"下载失败", short)
+        self._update_status(f"❌ {short}", "error")
 
     # ═══════════════════════════════════════════════════════
     # 历史
