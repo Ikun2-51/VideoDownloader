@@ -31,9 +31,13 @@ Python 路径（未加入 PATH 时）:
 
 ## 架构
 
-单文件 `video_downloader.py`（~1362 行），`VideoDownloaderApp` 类承载全部逻辑。
+单文件 `video_downloader.py`（~1655 行），`VideoDownloaderApp` 类承载全部逻辑。
 
-**批量下载**: 支持多行 URL 输入，解析后加入下载队列，逐个排队下载（一个完成自动开始下一个）。`DownloadTask` 数据类管理每个任务状态。
+**批量下载**: 支持多行 URL 输入，解析后加入下载队列，逐个排队下载。`DownloadTask` 数据类管理每个任务状态。
+
+**主题系统**: `ColorTheme` dataclass + 3 套预设（iOS 浅色 / iOS 深色 / Obsidian 深色），支持自定义调色盘编辑，主题自动持久化到 `%APPDATA%\VideoDownloader\theme.json`。
+
+**压缩包导出**: 内置 `_export_zip()` 一键打包源码为 zip，包含 `video_downloader.py`、`CLAUDE.md`、`.gitignore`、`requirements.txt`、`README.md`。
 
 **依赖**: `yt-dlp`（视频解析和下载引擎），可选 `ffmpeg`（视频和音频流合并）
 
