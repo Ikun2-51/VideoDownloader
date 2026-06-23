@@ -749,22 +749,41 @@ class VideoDownloaderApp:
             state="readonly", width=16, font=self.font_ui)
         preset_combo.pack(side=tk.LEFT, padx=(PAD, 0))
 
-        # Canvas 滚动
-        canvas = tk.Canvas(main, bg=t.bg_primary, highlightthickness=0, bd=0)
-        scrollbar = ttk.Scrollbar(main, orient=tk.VERTICAL, command=canvas.yview)
+        # Canvas 滚动区域
+        canvas_frame = ttk.Frame(main)
+        canvas_frame.pack(fill=tk.BOTH, expand=True, pady=(0, PAD_STD))
+
+        canvas = tk.Canvas(canvas_frame, bg=t.bg_primary,
+                            highlightthickness=0, bd=0)
+        scrollbar = ttk.Scrollbar(canvas_frame, orient=tk.VERTICAL,
+                                   command=canvas.yview)
         scroll_frame = ttk.Frame(canvas)
 
         scroll_frame.bind("<Configure>",
             lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.create_window((0, 0), window=scroll_frame, anchor="nw",
-                              tags="pf")
+        canvas_window_id = canvas.create_window(
+            (0, 0), window=scroll_frame, anchor="nw")
+
         canvas.configure(yscrollcommand=scrollbar.set)
 
-        def _on_cfg(event):
-            canvas.itemconfig("pf", width=event.width)
+        def _on_canvas_cfg(event):
+            """Canvas 大小变化时调整内部 frame 宽度 + 显隐滚动条"""
+            canvas.itemconfig(canvas_window_id, width=event.width)
+            # 内容超出时显示滚动条
+            req_h = scroll_frame.winfo_reqheight()
+            if req_h > event.height:
+                scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+            else:
+                scrollbar.pack_forget()
 
-        canvas.bind("<Configure>", _on_cfg)
+        canvas.bind("<Configure>", _on_canvas_cfg)
+
         canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        # 鼠标滚轮绑定
+        def _on_mousewheel(event):
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        canvas.bind("<Enter>", lambda e: canvas.bind_all("<MouseWheel>", _on_mousewheel))
+        canvas.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
 
         # 颜色字段定义
         color_fields = [
@@ -865,6 +884,9 @@ class VideoDownloaderApp:
         # 存储编辑窗口引用
         self._palette_window = win
         self._palette_edit_theme = edit_theme
+
+        # 触发初始布局计算，确保滚动条状态正确
+        win.update_idletasks()
 
     def _pick_color(self, key: str, var: tk.StringVar,
                      sample: tk.Canvas, edit_theme: ColorTheme):
