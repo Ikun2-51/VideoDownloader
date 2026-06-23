@@ -223,6 +223,7 @@ class VideoDownloaderApp:
         self.download_thread = None
         self.progress_queue = queue.Queue()
         self.parse_queue    = queue.Queue()
+        self._single_parse_result = None  # 单视频解析结果 {"status": ..., "data": ...}
         self._parse_after_id = None
         self._poll_after_id  = None
 
@@ -535,6 +536,10 @@ class VideoDownloaderApp:
             font=self.font_ui, borderwidth=0,
             highlightthickness=0, padx=8, pady=6, relief="flat")
         self.url_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        # 绑定文本变更 — 防抖自动解析第一个 URL（单视频模式）
+        self._url_text_after_id = None
+        self.url_text.bind("<<Modified>>", self._on_url_text_modified)
 
         btn_row = ttk.Frame(frame)
         btn_row.pack(fill=tk.X, pady=(PAD, 0))
@@ -1028,6 +1033,103 @@ pyinstaller --onefile --windowed --name "VideoDownloader" --clean --collect-all 
             return []
         return [line.strip() for line in text.splitlines() if line.strip()]
 
+    def _on_url_text_modified(self, event=None):
+        """文本变更 — 防抖 800ms 后自动解析第一个 URL（单视频预览）"""
+        # 清除 Modified 标志
+        self.url_text.edit_modified(False)
+        # 取消防抖
+        if self._url_text_after_id:
+            self.root.after_cancel(self._url_text_after_id)
+        # 防抖延迟
+        self._url_text_after_id = self.root.after(800, self._parse_first_url)
+
+    def _parse_first_url(self):
+        """自动解析 Text 中第一个 URL，填充视频信息卡片"""
+        if self.downloading:
+            return
+        urls = self._get_urls_from_text()
+        if not urls:
+            return
+        # 取第一个有效 URL
+        url = urls[0]
+        # 如果已经在队列里且有 info，直接显示
+        for task in self.download_queue:
+            if task.url == url and task.info:
+                self._show_task_info(task)
+                self._update_status(f"✅  {task.title}", "success")
+                return
+        # 否则后台解析
+        self._update_status("🔍  正在解析...", "info")
+        threading.Thread(target=self._extract_single_url, args=(url,), daemon=True).start()
+        self.root.after(200, self._check_single_parse)
+
+    def _extract_single_url(self, url):
+        """后台解析单个 URL"""
+        try:
+            import yt_dlp
+            ydl_opts = {"quiet": True, "no_warnings": True, "extract_flat": False}
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+            if info and info.get("_type") == "playlist" and "entries" in info:
+                entries = info.get("entries", [])
+                if entries:
+                    info = entries[0]
+            self._single_parse_result = {"status": "ok", "data": info}
+        except Exception as e:
+            self._single_parse_result = {"status": "error", "data": str(e)}
+
+    def _check_single_parse(self):
+        """轮询单视频解析结果"""
+        result = self._single_parse_result
+        if result is None:
+            # 还在解析中
+            if not self.downloading:
+                self.root.after(200, self._check_single_parse)
+            return
+        # 消费结果
+        self._single_parse_result = None
+        if result["status"] == "ok":
+            self._on_single_parsed(result["data"])
+        else:
+            self._update_status(f"❌  解析失败: {result['data'][:60]}", "error")
+
+    def _on_single_parsed(self, info: dict):
+        """单视频解析成功 — 填充 UI"""
+        self.video_info = info
+        self.video_formats = self._filter_formats(info)
+
+        title = info.get("title", "未知标题")
+        duration = info.get("duration", 0)
+        uploader = info.get("uploader", "") or info.get("channel", "") or ""
+
+        self.video_title_label.configure(text=title)
+        self.video_meta_label.configure(
+            text=f"时长: {self._format_duration(duration)}  ·  "
+                 f"平台: {info.get('extractor_key', '?')}")
+        self.video_uploader_label.configure(
+            text=f"上传者: {uploader}" if uploader else "")
+
+        # 填充格式下拉
+        if self.video_formats:
+            display = []
+            for f in self.video_formats:
+                h = f["height"]
+                e = f.get("ext", "?")
+                size = f.get("filesize") or f.get("filesize_approx") or 0
+                display.append(f"{h}p ({e})  ~ {self._format_filesize(size)}")
+            self.format_combo.configure(values=display)
+            self.format_combo.current(0)
+            self._set_ui_state("ready_to_download")
+            self._update_status(f"✅  {title} — {len(display)} 种分辨率", "success")
+        else:
+            self._update_status("❌  未找到可下载的格式", "error")
+
+        # 显示信息卡片
+        if not self.info_frame.winfo_ismapped():
+            self.info_frame.pack(before=self.format_frame, fill=tk.X,
+                                 pady=(0, PAD_STD))
+        self._canvas.configure(scrollregion=self._canvas.bbox("all"))
+
     def _on_paste(self):
         try:
             clip = self.root.clipboard_get()
@@ -1037,6 +1139,8 @@ pyinstaller --onefile --windowed --name "VideoDownloader" --clean --collect-all 
                     self.url_text.insert("end", "\n" + clip.strip())
                 else:
                     self.url_text.insert("1.0", clip.strip())
+                # 立即触发解析
+                self._url_text_after_id = self.root.after(100, self._parse_first_url)
         except tk.TclError:
             pass
 
