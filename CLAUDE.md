@@ -31,7 +31,9 @@ Python 路径（未加入 PATH 时）:
 
 ## 架构
 
-单文件 `video_downloader.py`（~1226 行），`VideoDownloaderApp` 类承载全部逻辑。
+单文件 `video_downloader.py`（~1362 行），`VideoDownloaderApp` 类承载全部逻辑。
+
+**批量下载**: 支持多行 URL 输入，解析后加入下载队列，逐个排队下载（一个完成自动开始下一个）。`DownloadTask` 数据类管理每个任务状态。
 
 **依赖**: `yt-dlp`（视频解析和下载引擎），可选 `ffmpeg`（视频和音频流合并）
 

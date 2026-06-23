@@ -4,6 +4,10 @@ Video Downloader — 桌面视频下载器
 基于 yt-dlp + Tkinter 的 Windows 桌面视频下载工具。
 支持 YouTube、Bilibili、Twitter/X、TikTok 等 1800+ 网站。
 审美参考 Obsidian：深色主题、紫色 accent、4px 网格系统。
+
+功能：
+- 单视频下载：输入链接 → 解析 → 选分辨率 → 下载
+- 批量下载：粘贴多个链接（每行一个）→ 加入队列 → 逐个排队下载
 """
 
 import tkinter as tk
@@ -18,6 +22,7 @@ import tempfile
 import shutil
 import subprocess
 from datetime import datetime
+from dataclasses import dataclass, field
 
 # ── Obsidian 色板 ──────────────────────────────────────
 
@@ -67,21 +72,32 @@ PLATFORM_NAMES = {
     "vimeo":      "Vimeo",
 }
 
-# yt-dlp extractor keys per platform (for platform hint)
-PLATFORM_EXTRACTORS = {
-    "youtube":   "youtube",
-    "bilibili":  "bilibili",
-    "twitter":   "twitter",
-    "tiktok":    "tiktok",
-    "instagram": "instagram",
-    "vimeo":     "vimeo",
-}
-
 # ── 自定义异常 ──────────────────────────────────────────
 
 class DownloadCancelled(Exception):
     """用户取消下载"""
     pass
+
+
+# ── 下载任务数据类 ──────────────────────────────────────
+
+@dataclass
+class DownloadTask:
+    """单个下载任务的状态"""
+    url: str
+    title: str = ""
+    duration: str = ""
+    uploader: str = ""
+    status: str = "pending"  # pending | parsing | queued | downloading | completed | failed | cancelled
+    format_id: str = ""
+    format_label: str = ""
+    info: dict | None = None
+    progress: float = 0.0
+    speed: str = "--"
+    eta: str = "--"
+    error_msg: str = ""
+    filepath: str = ""
+    formats: list = field(default_factory=list)
 
 
 # ── 主应用类 ────────────────────────────────────────────
@@ -92,23 +108,27 @@ class VideoDownloaderApp:
     def __init__(self):
         self.root = tk.Tk()
         self.root.title("Video Downloader")
-        self.root.geometry("700x800")
-        self.root.minsize(520, 680)
+        self.root.geometry("750x880")
+        self.root.minsize(550, 720)
         self.root.configure(bg=BG_PRIMARY)
 
         self._set_app_id()
 
         # ── 状态变量 ──────────────────────────────
-        self.url_var        = tk.StringVar()
         self.platform_var   = tk.StringVar(value="")
         self.save_path_var  = tk.StringVar(value=os.path.expanduser("~\\Downloads"))
         self.format_var     = tk.StringVar()
 
-        # 视频信息（解析后填充）
+        # 单视频模式（保留兼容）
         self.video_info     = None
         self.video_formats  = []
-        self.thumbnail_img  = None   # tk.PhotoImage 引用（防 GC）
-        self._thumb_path    = None   # 临时缩略图文件路径
+        self.thumbnail_img  = None
+        self._thumb_path    = None
+
+        # 批量下载队列
+        self.download_queue: list[DownloadTask] = []
+        self._current_task: DownloadTask | None = None
+        self._batch_mode = False       # True = 队列批量模式
 
         # 下载状态
         self.downloading    = False
@@ -118,6 +138,7 @@ class VideoDownloaderApp:
         self.parse_queue    = queue.Queue()
         self._parse_after_id = None
         self._poll_after_id  = None
+        self._parse_batch_idx = 0    # 当前批量解析的序号
 
         # 下载历史
         self.download_history = []
@@ -130,9 +151,6 @@ class VideoDownloaderApp:
         self._build_ui()
         self._bind_keys()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
-
-        # 启动就置入默认路径
-        self.save_path_var.set(os.path.expanduser("~\\Downloads"))
 
     # ═══════════════════════════════════════════════════════
     # 窗口设置
@@ -152,7 +170,7 @@ class VideoDownloaderApp:
         """绑定快捷键"""
         self.root.bind("<Control-v>", lambda e: self._on_paste())
         self.root.bind("<Control-V>", lambda e: self._on_paste())
-        self.root.bind("<Escape>", lambda e: self._cancel_download())
+        self.root.bind("<Escape>", lambda e: self._cancel_all_downloads())
 
     # ═══════════════════════════════════════════════════════
     # 样式
@@ -163,111 +181,68 @@ class VideoDownloaderApp:
         style = ttk.Style()
         style.theme_use("clam")
 
-        # ── 基础 ──────────────────────────────────
         style.configure(".",
-            background=BG_PRIMARY,
-            foreground=TEXT_PRIMARY,
-            fieldbackground=BG_TERTIARY,
-            bordercolor=BORDER,
+            background=BG_PRIMARY, foreground=TEXT_PRIMARY,
+            fieldbackground=BG_TERTIARY, bordercolor=BORDER,
             font=(FONT_UI, 10),
         )
 
-        # ── Frame ──────────────────────────────────
         style.configure("TFrame", background=BG_PRIMARY)
         style.configure("Card.TFrame", background=BG_SECONDARY, relief="flat")
 
-        # ── Label ──────────────────────────────────
-        style.configure("TLabel",
-            background=BG_PRIMARY,
-            foreground=TEXT_PRIMARY,
-            font=(FONT_UI, 10),
-        )
-        style.configure("Title.TLabel",
-            font=(FONT_UI, 22, "bold"),
-            foreground=ACCENT,
-        )
-        style.configure("Heading.TLabel",
-            font=(FONT_UI, 13, "bold"),
-            foreground=TEXT_PRIMARY,
-        )
-        style.configure("Card.TLabel",
-            background=BG_SECONDARY,
-            foreground=TEXT_PRIMARY,
-            font=(FONT_UI, 10),
-        )
-        style.configure("CardHeading.TLabel",
-            background=BG_SECONDARY,
-            foreground=TEXT_PRIMARY,
-            font=(FONT_UI, 12, "bold"),
-        )
-        style.configure("Muted.TLabel",
-            foreground=TEXT_MUTED,
-            font=(FONT_UI, 9),
-        )
+        style.configure("TLabel", background=BG_PRIMARY,
+                        foreground=TEXT_PRIMARY, font=(FONT_UI, 10))
+        style.configure("Title.TLabel", font=(FONT_UI, 22, "bold"),
+                        foreground=ACCENT)
+        style.configure("Heading.TLabel", font=(FONT_UI, 13, "bold"),
+                        foreground=TEXT_PRIMARY)
+        style.configure("Card.TLabel", background=BG_SECONDARY,
+                        foreground=TEXT_PRIMARY, font=(FONT_UI, 10))
+        style.configure("CardHeading.TLabel", background=BG_SECONDARY,
+                        foreground=TEXT_PRIMARY, font=(FONT_UI, 12, "bold"))
+        style.configure("Muted.TLabel", foreground=TEXT_MUTED, font=(FONT_UI, 9))
         style.configure("Success.TLabel", foreground=SUCCESS_COLOR)
         style.configure("Error.TLabel", foreground=ERROR_COLOR)
         style.configure("Warning.TLabel", foreground=WARNING_COLOR)
 
-        # ── Button ─────────────────────────────────
-        style.configure("TButton",
-            background=BG_TERTIARY,
-            foreground=TEXT_PRIMARY,
-            borderwidth=1,
-            relief="flat",
-            padding=(PAD_STD, PAD),
-            font=(FONT_UI, 10),
-        )
+        style.configure("TButton", background=BG_TERTIARY,
+                        foreground=TEXT_PRIMARY, borderwidth=1, relief="flat",
+                        padding=(PAD_STD, PAD), font=(FONT_UI, 10))
         style.map("TButton",
             background=[("active", "#3a3a3a"), ("pressed", BG_TERTIARY)],
             foreground=[("active", "#ffffff")],
         )
 
-        # Accent 按钮（紫色主按钮）
-        style.configure("Accent.TButton",
-            background=ACCENT,
-            foreground="#ffffff",
-            font=(FONT_UI, 12, "bold"),
-            borderwidth=0,
-            padding=(PAD_WIDE, PAD_COMFORT),
-        )
+        style.configure("Accent.TButton", background=ACCENT,
+                        foreground="#ffffff", font=(FONT_UI, 12, "bold"),
+                        borderwidth=0, padding=(PAD_WIDE, PAD_COMFORT))
         style.map("Accent.TButton",
             background=[("active", ACCENT_HOVER), ("pressed", ACCENT)],
             foreground=[("active", "#ffffff")],
         )
 
-        # Danger 按钮（红色取消）
-        style.configure("Danger.TButton",
-            background=ERROR_COLOR,
-            foreground="#ffffff",
-            font=(FONT_UI, 12, "bold"),
-            borderwidth=0,
-            padding=(PAD_WIDE, PAD_COMFORT),
-        )
+        style.configure("Danger.TButton", background=ERROR_COLOR,
+                        foreground="#ffffff", font=(FONT_UI, 12, "bold"),
+                        borderwidth=0, padding=(PAD_WIDE, PAD_COMFORT))
         style.map("Danger.TButton",
             background=[("active", "#ef4444"), ("pressed", ERROR_COLOR)],
             foreground=[("active", "#ffffff")],
         )
 
-        # ── Entry ──────────────────────────────────
-        style.configure("TEntry",
-            fieldbackground=BG_TERTIARY,
-            foreground=TEXT_PRIMARY,
-            borderwidth=1,
-            relief="solid",
-            padding=6,
-        )
+        style.configure("Small.TButton", font=(FONT_UI, 9),
+                        padding=(PAD, PAD_TIGHT))
+
+        style.configure("TEntry", fieldbackground=BG_TERTIARY,
+                        foreground=TEXT_PRIMARY, borderwidth=1,
+                        relief="solid", padding=6)
         style.map("TEntry",
             fieldbackground=[("focus", BG_TERTIARY)],
             bordercolor=[("focus", ACCENT)],
         )
 
-        # ── Combobox ───────────────────────────────
-        style.configure("TCombobox",
-            fieldbackground=BG_TERTIARY,
-            foreground=TEXT_PRIMARY,
-            arrowcolor=TEXT_PRIMARY,
-            background=BG_TERTIARY,
-        )
+        style.configure("TCombobox", fieldbackground=BG_TERTIARY,
+                        foreground=TEXT_PRIMARY, arrowcolor=TEXT_PRIMARY,
+                        background=BG_TERTIARY)
         style.map("TCombobox",
             fieldbackground=[("readonly", BG_TERTIARY), ("focus", BG_TERTIARY)],
             bordercolor=[("focus", ACCENT)],
@@ -277,22 +252,23 @@ class VideoDownloaderApp:
         self.root.option_add("*TCombobox*Listbox.selectBackground", ACCENT)
         self.root.option_add("*TCombobox*Listbox.selectForeground", "#ffffff")
 
-        # ── Progressbar ────────────────────────────
-        style.configure("TProgressbar",
-            background=ACCENT,
-            troughcolor=BG_SECONDARY,
-            bordercolor=BORDER,
-        )
-
-        # ── Separator ──────────────────────────────
+        style.configure("TProgressbar", background=ACCENT,
+                        troughcolor=BG_SECONDARY, bordercolor=BORDER)
         style.configure("TSeparator", background=BORDER)
 
-        # ── LabelFrame ─────────────────────────────
-        style.configure("Card.TLabelframe", background=BG_SECONDARY)
-        style.configure("Card.TLabelframe.Label",
-            background=BG_SECONDARY,
-            foreground=TEXT_PRIMARY,
-            font=(FONT_UI, 11, "bold"),
+        # Treeview 暗色主题
+        style.configure("Queue.Treeview",
+            background=BG_SECONDARY, foreground=TEXT_PRIMARY,
+            fieldbackground=BG_SECONDARY, borderwidth=0,
+            font=(FONT_UI, 10),
+        )
+        style.configure("Queue.Treeview.Heading",
+            background=BG_TERTIARY, foreground=TEXT_MUTED,
+            font=(FONT_UI, 9, "bold"), borderwidth=0,
+        )
+        style.map("Queue.Treeview",
+            background=[("selected", ACCENT)],
+            foreground=[("selected", "#ffffff")],
         )
 
     # ═══════════════════════════════════════════════════════
@@ -301,11 +277,9 @@ class VideoDownloaderApp:
 
     def _build_ui(self):
         """构建全部界面"""
-        # 主容器
         self.main_frame = ttk.Frame(self.root, padding=(PAD_XL, PAD_WIDE))
         self.main_frame.pack(fill=tk.BOTH, expand=True)
 
-        # 滚动支持 — Canvas + Scrollbar
         self._canvas = tk.Canvas(self.main_frame, bg=BG_PRIMARY,
                                   highlightthickness=0, bd=0)
         self._scrollbar = ttk.Scrollbar(self.main_frame, orient=tk.VERTICAL,
@@ -317,138 +291,187 @@ class VideoDownloaderApp:
 
         self._canvas_window = self._canvas.create_window(
             (0, 0), window=self._scroll_frame, anchor="nw", tags="scroll_frame")
-
         self._canvas.configure(yscrollcommand=self._scrollbar.set)
-
-        # Canvas 大小跟随
         self._canvas.bind("<Configure>", self._on_canvas_configure)
 
         self._canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        # 滚动条先隐藏，内容多了再显示
 
-        # ── 标题 ───────────────────────────────────
+        # ── 各区域 ────────────────────────────────
         self._build_title(self._scroll_frame)
-
-        # ── URL 输入 ──────────────────────────────
         self._build_url_section(self._scroll_frame)
-
-        # ── 视频信息卡片 ──────────────────────────
+        self._build_queue_section(self._scroll_frame)
         self._build_video_info(self._scroll_frame)
-
-        # ── 格式 & 保存路径 ───────────────────────
         self._build_format_section(self._scroll_frame)
-
-        # ── 下载按钮 ──────────────────────────────
         self._build_download_button(self._scroll_frame)
-
-        # ── 进度区域 ──────────────────────────────
         self._build_progress_section(self._scroll_frame)
-
-        # ── 下载历史 ──────────────────────────────
         self._build_history_section(self._scroll_frame)
-
-        # ── 状态栏 ────────────────────────────────
         self._build_status_bar(self.main_frame)
 
     def _on_canvas_configure(self, event):
-        """Canvas 大小变化时调整内部 frame 宽度"""
         self._canvas.itemconfig(self._canvas_window, width=event.width)
-        # 显示/隐藏滚动条
         if self._scroll_frame.winfo_reqheight() > event.height:
             self._scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         else:
             self._scrollbar.pack_forget()
 
     def _build_title(self, parent):
-        """标题栏"""
         frame = ttk.Frame(parent)
         frame.pack(fill=tk.X, pady=(0, PAD_WIDE))
-
         ttk.Label(frame, text="Video Downloader",
                   style="Title.TLabel").pack(anchor="w")
-
-        subtitle = "下载 YouTube · Bilibili · Twitter · TikTok 等 1800+ 网站的视频"
-        ttk.Label(frame, text=subtitle, style="Muted.TLabel").pack(anchor="w", pady=(PAD_TIGHT, 0))
-
-        # FFmpeg 提示
+        ttk.Label(frame, text="下载 YouTube · Bilibili · Twitter · TikTok 等 1800+ 网站的视频",
+                  style="Muted.TLabel").pack(anchor="w", pady=(PAD_TIGHT, 0))
         if not self.has_ffmpeg:
-            ttk.Label(frame,
-                text="⚠ FFmpeg 未安装 — 部分格式合并不可用",
-                style="Warning.TLabel").pack(anchor="w", pady=(PAD, 0))
-
+            ttk.Label(frame, text="⚠ FFmpeg 未安装 — 部分格式合并不可用",
+                      style="Warning.TLabel").pack(anchor="w", pady=(PAD, 0))
         ttk.Separator(parent, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=(PAD_STD, PAD_STD))
 
     def _build_url_section(self, parent):
-        """URL 输入区域"""
+        """URL 输入区域 — 多行文本 + 操作按钮"""
         frame = ttk.Frame(parent)
         frame.pack(fill=tk.X, pady=(0, PAD_STD))
 
-        # 第一行：URL 标签 + 输入框 + 粘贴按钮
-        row1 = ttk.Frame(frame)
-        row1.pack(fill=tk.X)
-        ttk.Label(row1, text="视频链接", style="Heading.TLabel").pack(anchor="w")
+        # 标题行
+        ttk.Label(frame, text="视频链接（每行一个）",
+                  style="Heading.TLabel").pack(anchor="w")
 
-        row2 = ttk.Frame(frame)
-        row2.pack(fill=tk.X, pady=(PAD, 0))
+        # 多行文本输入
+        text_frame = tk.Frame(frame, bg=BG_TERTIARY, highlightbackground=BORDER,
+                               highlightthickness=1)
+        text_frame.pack(fill=tk.X, pady=(PAD, 0))
 
-        self.url_entry = ttk.Entry(row2, textvariable=self.url_var, font=(FONT_UI, 11))
-        self.url_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, PAD))
-
-        self.paste_btn = ttk.Button(row2, text="粘贴", command=self._on_paste, width=8)
-        self.paste_btn.pack(side=tk.RIGHT)
-
-        # URL 变更防抖
-        self.url_var.trace_add("write", self._on_url_change)
-
-        # 第二行：平台选择
-        row3 = ttk.Frame(frame)
-        row3.pack(fill=tk.X, pady=(PAD, 0))
-
-        ttk.Label(row3, text="平台").pack(side=tk.LEFT)
-
-        platforms = list(PLATFORM_NAMES.values())
-        self.platform_combo = ttk.Combobox(
-            row3, textvariable=self.platform_var,
-            values=platforms,
-            state="readonly",
-            width=16,
+        self.url_text = tk.Text(
+            text_frame, height=3, wrap=tk.NONE,
+            bg=BG_TERTIARY, fg=TEXT_PRIMARY,
+            insertbackground=TEXT_PRIMARY,
             font=(FONT_UI, 10),
+            borderwidth=0, highlightthickness=0,
+            padx=6, pady=4,
+            relief="flat",
+        )
+        self.url_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        # 文本滚动条
+        text_scroll = ttk.Scrollbar(text_frame, orient=tk.VERTICAL,
+                                     command=self.url_text.yview)
+        self.url_text.configure(yscrollcommand=text_scroll.set)
+
+        # 按钮行
+        btn_row = ttk.Frame(frame)
+        btn_row.pack(fill=tk.X, pady=(PAD, 0))
+
+        self.paste_btn = ttk.Button(btn_row, text="粘贴", command=self._on_paste, width=6)
+        self.paste_btn.pack(side=tk.LEFT, padx=(0, PAD))
+
+        self.add_queue_btn = ttk.Button(btn_row, text="解析并加入队列",
+                                         command=self._add_urls_to_queue,
+                                         style="Accent.TButton")
+        self.add_queue_btn.pack(side=tk.LEFT, padx=(0, PAD))
+
+        self.clear_url_btn = ttk.Button(btn_row, text="清空输入",
+                                         command=self._clear_url_text, width=8)
+        self.clear_url_btn.pack(side=tk.LEFT)
+
+        # 平台选择
+        ttk.Label(btn_row, text="平台:").pack(side=tk.LEFT, padx=(PAD_STD, PAD_TIGHT))
+        self.platform_combo = ttk.Combobox(
+            btn_row, textvariable=self.platform_var,
+            values=list(PLATFORM_NAMES.values()),
+            state="readonly", width=14, font=(FONT_UI, 10),
         )
         self.platform_combo.set(PLATFORM_NAMES[""])
-        self.platform_combo.pack(side=tk.LEFT, padx=(PAD, 0))
-        self.platform_combo.bind("<<ComboboxSelected>>", self._on_platform_select)
+        self.platform_combo.pack(side=tk.LEFT)
+
+    def _build_queue_section(self, parent):
+        """下载队列列表 — Treeview"""
+        self.queue_frame = ttk.Frame(parent)
+        # 默认隐藏，有任务时显示
+
+        # 标题栏
+        q_header = ttk.Frame(self.queue_frame)
+        q_header.pack(fill=tk.X)
+
+        self.queue_title_label = ttk.Label(q_header, text="下载队列 (0)",
+                                            style="Heading.TLabel")
+        self.queue_title_label.pack(side=tk.LEFT)
+
+        self.clear_done_btn = ttk.Button(q_header, text="清空已完成",
+                                          command=self._clear_completed,
+                                          style="Small.TButton")
+        self.clear_done_btn.pack(side=tk.RIGHT)
+
+        # Treeview
+        tree_frame = tk.Frame(self.queue_frame, bg=BG_SECONDARY)
+        tree_frame.pack(fill=tk.X, pady=(PAD, 0))
+
+        columns = ("status", "title", "progress")
+        self.queue_tree = ttk.Treeview(
+            tree_frame, columns=columns, show="headings",
+            style="Queue.Treeview", height=5,
+            selectmode="browse",
+        )
+        self.queue_tree.heading("status", text="状态", anchor="center")
+        self.queue_tree.heading("title", text="视频")
+        self.queue_tree.heading("progress", text="进度", anchor="center")
+
+        self.queue_tree.column("status", width=50, anchor="center", stretch=False)
+        self.queue_tree.column("title", width=420, stretch=True)
+        self.queue_tree.column("progress", width=80, anchor="center", stretch=False)
+
+        self.queue_tree.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        # 树滚动条
+        tree_scroll = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL,
+                                     command=self.queue_tree.yview)
+        self.queue_tree.configure(yscrollcommand=tree_scroll.set)
+
+        # 绑定事件
+        self.queue_tree.bind("<<TreeviewSelect>>", self._on_queue_select)
+        self.queue_tree.bind("<Double-1>", self._on_queue_double_click)
+        self.queue_tree.bind("<Button-3>", self._on_queue_right_click)
+
+        # 操作按钮行
+        q_btn_row = ttk.Frame(self.queue_frame)
+        q_btn_row.pack(fill=tk.X, pady=(PAD, 0))
+
+        self.batch_download_btn = ttk.Button(
+            q_btn_row, text="▶  全部下载",
+            style="Accent.TButton",
+            command=self._start_all_downloads,
+        )
+        self.batch_download_btn.pack(side=tk.LEFT, fill=tk.X, expand=True,
+                                      padx=(0, PAD))
+
+        self.cancel_queue_btn = ttk.Button(
+            q_btn_row, text="取消全部",
+            style="Danger.TButton",
+            command=self._cancel_all_downloads,
+        )
+        self.cancel_queue_btn.pack(side=tk.RIGHT, fill=tk.X, expand=True)
 
     def _build_video_info(self, parent):
         """视频信息卡片"""
         self.info_frame = ttk.Frame(parent, style="Card.TFrame")
-        # 默认隐藏，解析成功后显示
 
-        # 内容用 pack 放在卡片内部
         self.info_inner = ttk.Frame(self.info_frame, style="Card.TFrame")
         self.info_inner.pack(fill=tk.X, padx=PAD_STD, pady=PAD_STD)
 
-        # 缩略图
         self.thumb_label = ttk.Label(self.info_inner, style="Card.TLabel")
         self.thumb_label.pack(side=tk.LEFT, padx=(0, PAD_STD))
 
-        # 右侧文字
         text_frame = ttk.Frame(self.info_inner, style="Card.TFrame")
         text_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
         self.video_title_label = ttk.Label(
-            text_frame, text="", style="CardHeading.TLabel",
-            wraplength=420,
-        )
+            text_frame, text="", style="CardHeading.TLabel", wraplength=420)
         self.video_title_label.pack(anchor="w")
 
         self.video_meta_label = ttk.Label(
-            text_frame, text="", style="Muted.TLabel",
-        )
+            text_frame, text="", style="Muted.TLabel")
         self.video_meta_label.pack(anchor="w", pady=(PAD_TIGHT, 0))
 
         self.video_uploader_label = ttk.Label(
-            text_frame, text="", style="Muted.TLabel",
-        )
+            text_frame, text="", style="Muted.TLabel")
         self.video_uploader_label.pack(anchor="w")
 
     def _build_format_section(self, parent):
@@ -457,21 +480,15 @@ class VideoDownloaderApp:
         self.format_frame.pack(fill=tk.X, pady=(PAD_STD, PAD_STD))
         frame = self.format_frame
 
-        # 分辨率
         ttk.Label(frame, text="分辨率", style="Heading.TLabel").pack(anchor="w")
 
         fmt_row = ttk.Frame(frame)
         fmt_row.pack(fill=tk.X, pady=(PAD, 0))
-
         self.format_combo = ttk.Combobox(
             fmt_row, textvariable=self.format_var,
-            state="readonly",
-            font=(FONT_UI, 10),
-        )
+            state="readonly", font=(FONT_UI, 10))
         self.format_combo.pack(fill=tk.X)
-        self.format_combo.bind("<<ComboboxSelected>>", lambda e: None)
 
-        # 保存路径
         path_label_frame = ttk.Frame(frame)
         path_label_frame.pack(fill=tk.X, pady=(PAD_STD, 0))
         ttk.Label(path_label_frame, text="保存到",
@@ -479,66 +496,47 @@ class VideoDownloaderApp:
 
         path_row = ttk.Frame(frame)
         path_row.pack(fill=tk.X, pady=(PAD, 0))
-
         self.save_entry = ttk.Entry(path_row, textvariable=self.save_path_var,
                                      font=(FONT_UI, 10))
         self.save_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, PAD))
-
         self.browse_btn = ttk.Button(path_row, text="浏览...",
                                       command=self._browse_save_path, width=8)
         self.browse_btn.pack(side=tk.RIGHT)
 
     def _build_download_button(self, parent):
-        """下载 / 取消按钮"""
-        btn_frame = ttk.Frame(parent)
-        btn_frame.pack(fill=tk.X, pady=(PAD, PAD_STD))
+        """下载按钮 — 单视频模式"""
+        self.dl_btn_frame = ttk.Frame(parent)
+        self.dl_btn_frame.pack(fill=tk.X, pady=(PAD, PAD_STD))
 
         self.download_btn = ttk.Button(
-            btn_frame,
-            text="⬇  开始下载",
-            style="Accent.TButton",
-            command=self._start_download,
-        )
+            self.dl_btn_frame, text="⬇  下载当前视频",
+            style="Accent.TButton", command=self._start_single_download)
         self.download_btn.pack(fill=tk.X, ipady=4)
 
     def _build_progress_section(self, parent):
         """下载进度区域"""
         self.progress_frame = ttk.Frame(parent)
-        # 默认隐藏
 
-        # 进度条
         self.progress_bar = ttk.Progressbar(
-            self.progress_frame,
-            mode="determinate",
-            maximum=100,
-        )
+            self.progress_frame, mode="determinate", maximum=100)
         self.progress_bar.pack(fill=tk.X)
 
-        # 百分比
         self.pct_label = ttk.Label(
-            self.progress_frame,
-            text="0%",
-            font=(FONT_UI, 24, "bold"),
-            foreground=ACCENT,
-            background=BG_PRIMARY,
-            anchor="center",
-        )
+            self.progress_frame, text="0%",
+            font=(FONT_UI, 24, "bold"), foreground=ACCENT,
+            background=BG_PRIMARY, anchor="center")
         self.pct_label.pack(pady=(PAD_STD, PAD))
 
-        # 速度 + ETA 行
         info_row = ttk.Frame(self.progress_frame)
         info_row.pack(fill=tk.X)
-
         self.speed_label = ttk.Label(info_row, text="速度: --", style="Muted.TLabel")
         self.speed_label.pack(side=tk.LEFT)
-
         self.eta_label = ttk.Label(info_row, text="剩余: --", style="Muted.TLabel")
         self.eta_label.pack(side=tk.RIGHT)
 
     def _build_history_section(self, parent):
         """下载历史"""
         self.history_frame = ttk.Frame(parent)
-        # 默认隐藏
 
         ttk.Separator(self.history_frame, orient=tk.HORIZONTAL).pack(
             fill=tk.X, pady=(PAD_STD, PAD_STD))
@@ -551,19 +549,11 @@ class VideoDownloaderApp:
                                           command=self._clear_history, width=6)
         self.clear_hist_btn.pack(side=tk.RIGHT)
 
-        # 历史列表（使用 tk.Listbox 而非 ttk，因为后者不支持自定义颜色）
         self.history_listbox = tk.Listbox(
-            self.history_frame,
-            bg=BG_SECONDARY,
-            fg=TEXT_PRIMARY,
-            selectbackground=ACCENT,
-            selectforeground="#ffffff",
-            font=(FONT_UI, 9),
-            height=6,
-            borderwidth=0,
-            highlightthickness=0,
-            activestyle="none",
-        )
+            self.history_frame, bg=BG_SECONDARY, fg=TEXT_PRIMARY,
+            selectbackground=ACCENT, selectforeground="#ffffff",
+            font=(FONT_UI, 9), height=6, borderwidth=0,
+            highlightthickness=0, activestyle="none")
         self.history_listbox.pack(fill=tk.X, pady=(PAD, 0))
 
     def _build_status_bar(self, parent):
@@ -574,176 +564,284 @@ class VideoDownloaderApp:
         ttk.Separator(status_frame, orient=tk.HORIZONTAL).pack(fill=tk.X)
 
         self.status_label = ttk.Label(
-            status_frame,
-            text="✅  就绪",
-            font=(FONT_UI, 10),
-            foreground=TEXT_SECONDARY,
-            background=BG_PRIMARY,
-        )
+            status_frame, text="✅  就绪", font=(FONT_UI, 10),
+            foreground=TEXT_SECONDARY, background=BG_PRIMARY)
         self.status_label.pack(anchor="w", pady=(PAD, 0))
 
     # ═══════════════════════════════════════════════════════
-    # URL 解析
+    # URL 输入处理
     # ═══════════════════════════════════════════════════════
 
-    def _on_url_change(self, *args):
-        """URL 变更 — 防抖 500ms 后自动解析"""
-        url = self.url_var.get().strip()
-        if not url:
-            return
-        # 取消之前的待处理
-        if self._parse_after_id:
-            self.root.after_cancel(self._parse_after_id)
-        self._parse_after_id = self.root.after(500, self._parse_url)
+    def _get_urls_from_text(self):
+        """从多行 Text 中提取非空 URL 列表"""
+        text = self.url_text.get("1.0", "end-1c").strip()
+        if not text:
+            return []
+        return [line.strip() for line in text.splitlines() if line.strip()]
 
     def _on_paste(self):
-        """粘贴按钮：读取剪贴板并立即解析"""
+        """粘贴按钮：读取剪贴板并填入 Text"""
         try:
-            text = self.root.clipboard_get()
-            if text and text.strip():
-                self.url_var.set(text.strip())
-                # 取消防抖，立即解析
-                if self._parse_after_id:
-                    self.root.after_cancel(self._parse_after_id)
-                self._parse_url()
+            clip = self.root.clipboard_get()
+            if clip and clip.strip():
+                # 如果 Text 中已有内容，追加到末尾
+                current = self.url_text.get("1.0", "end-1c").rstrip()
+                if current:
+                    self.url_text.insert("end", "\n" + clip.strip())
+                else:
+                    self.url_text.insert("1.0", clip.strip())
         except tk.TclError:
-            # 剪贴板可能为空或非文本
             pass
 
-    def _on_platform_select(self, event):
-        """平台选择变更"""
-        url = self.url_var.get().strip()
-        if url:
-            if self._parse_after_id:
-                self.root.after_cancel(self._parse_after_id)
-            self._parse_url()
+    def _clear_url_text(self):
+        """清空 URL 输入"""
+        self.url_text.delete("1.0", "end")
 
-    def _get_platform_key(self):
-        """将 combobox 选择映射回 platform key"""
-        val = self.platform_var.get()
-        for key, name in PLATFORM_NAMES.items():
-            if name == val:
-                return key
-        return ""
+    # ═══════════════════════════════════════════════════════
+    # 队列管理
+    # ═══════════════════════════════════════════════════════
 
-    def _detect_platform(self, url):
-        """根据 URL 自动检测平台"""
-        url_lower = url.lower()
-        for platform, pattern in PLATFORM_PATTERNS.items():
-            if re.search(pattern, url_lower):
-                return platform
-        return None
-
-    def _parse_url(self):
-        """在后台线程解析 URL"""
-        url = self.url_var.get().strip()
-        if not url or self.downloading:
+    def _add_urls_to_queue(self):
+        """解析 Text 中的 URL 并加入下载队列"""
+        urls = self._get_urls_from_text()
+        if not urls:
+            self._update_status("⚠  请先输入视频链接", "warning")
             return
 
-        self._update_status("🔍  正在解析视频信息...", "info")
-        self._set_ui_state("parsing")
+        # 过滤已存在的 URL
+        existing_urls = {t.url for t in self.download_queue}
+        new_urls = [u for u in urls if u not in existing_urls]
 
+        if not new_urls:
+            self._update_status("⚠  所有链接已在队列中", "warning")
+            return
+
+        for url in new_urls:
+            task = DownloadTask(url=url, status="pending")
+            self.download_queue.append(task)
+
+        self._refresh_queue_ui()
+        self._update_status(f"📋  已添加 {len(new_urls)} 个链接到队列 (共 {len(self.download_queue)} 个)", "info")
+
+        # 自动开始解析队列中的 pending 任务
+        self._parse_next_in_queue()
+
+    def _parse_next_in_queue(self):
+        """逐个解析队列中待解析的任务"""
+        # 找到第一个 pending 任务
+        for i, task in enumerate(self.download_queue):
+            if task.status == "pending":
+                task.status = "parsing"
+                self._refresh_queue_ui()
+                self._parse_task(task, i)
+                return
+
+    def _parse_task(self, task: DownloadTask, idx: int):
+        """在后台线程解析单个 task 的 URL"""
         def _extract():
             try:
-                ydl_opts = {
-                    "quiet": True,
-                    "no_warnings": True,
-                    "extract_flat": False,
-                }
-                with __import__("yt_dlp").YoutubeDL(ydl_opts) as ydl:
-                    info = ydl.extract_info(url, download=False)
+                ydl_opts = {"quiet": True, "no_warnings": True, "extract_flat": False}
+                import yt_dlp
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(task.url, download=False)
 
-                # 如果是播放列表，取第一个
                 if info and info.get("_type") == "playlist" and "entries" in info:
                     entries = info.get("entries", [])
                     if entries:
                         info = entries[0]
-                    else:
-                        self.parse_queue.put(("error", "播放列表为空"))
-                        return
 
-                self.parse_queue.put(("success", info))
+                task.info = info
+                task.title = info.get("title", "未知标题")
+                task.duration = self._format_duration(info.get("duration", 0))
+                task.uploader = info.get("uploader", "") or info.get("channel", "") or ""
+                task.formats = self._filter_formats(info)
+                if task.formats:
+                    f0 = task.formats[0]
+                    task.format_id = f0.get("format_id", "")
+                    task.format_label = f"{f0['height']}p ({f0.get('ext','?')})"
+                task.status = "queued"
             except Exception as e:
-                err_msg = str(e)
-                # 简化常见错误
-                if "HTTP Error 404" in err_msg:
-                    err_msg = "视频未找到 (404)"
-                elif "HTTP Error 403" in err_msg:
-                    err_msg = "访问被拒绝 (403)"
-                elif "Unsupported URL" in err_msg:
-                    err_msg = "不支持的链接格式"
-                elif "connection" in err_msg.lower() or "getaddrinfo" in err_msg:
-                    err_msg = "网络连接失败，请检查网络"
-                self.parse_queue.put(("error", err_msg))
+                task.status = "failed"
+                task.error_msg = str(e)
+                # 简化错误
+                err = str(e)
+                if "HTTP Error 404" in err:
+                    task.error_msg = "视频未找到 (404)"
+                elif "Unsupported URL" in err:
+                    task.error_msg = "不支持的链接格式"
+                elif "connection" in err.lower():
+                    task.error_msg = "网络连接失败"
+
+            self.parse_queue.put(("task_parsed", idx))
 
         threading.Thread(target=_extract, daemon=True).start()
         self.root.after(100, self._check_parse_result)
 
     def _check_parse_result(self):
-        """轮询解析结果"""
+        """轮询任务解析结果"""
         try:
             while True:
                 status, data = self.parse_queue.get_nowait()
-                if status == "success":
-                    self._on_parse_complete(data)
-                else:
-                    self._update_status(f"❌  {data}", "error")
-                    self._set_ui_state("ready")
+                if status == "task_parsed":
+                    idx = data
+                    task = self.download_queue[idx]
+                    if task.status == "failed":
+                        self._update_status(f"❌  解析失败: {task.error_msg}", "error")
+                    else:
+                        self._update_status(f"✅  解析完成: {task.title}", "success")
+                    self._refresh_queue_ui()
+                    # 继续解析下一个
+                    self._parse_next_in_queue()
         except queue.Empty:
-            # 还在解析中，继续等待
-            if not self.downloading:
+            # 还有任务在解析中
+            if any(t.status == "parsing" for t in self.download_queue):
                 self.root.after(200, self._check_parse_result)
 
-    def _on_parse_complete(self, info):
-        """解析成功，填充 UI"""
-        self.video_info = info
+    def _refresh_queue_ui(self):
+        """刷新队列 Treeview 显示"""
+        # 清空现有行
+        for item in self.queue_tree.get_children():
+            self.queue_tree.delete(item)
 
-        title = info.get("title", "未知标题")
-        duration = info.get("duration", 0)
-        uploader = info.get("uploader", "") or info.get("channel", "") or ""
-        thumb_url = info.get("thumbnail", "")
+        status_icons = {
+            "pending":   "⏳",
+            "parsing":   "🔍",
+            "queued":    "📋",
+            "downloading": "⬇",
+            "completed": "✅",
+            "failed":    "❌",
+            "cancelled": "⏹",
+        }
 
-        # 填充文字
-        self.video_title_label.configure(text=title)
+        for i, task in enumerate(self.download_queue):
+            icon = status_icons.get(task.status, "?")
+            title = task.title or task.url[:60] + ("..." if len(task.url) > 60 else "")
+
+            if task.status == "downloading":
+                progress = f"{task.progress:.0f}%"
+            elif task.status == "completed":
+                progress = "100%"
+            elif task.status == "failed":
+                progress = "失败"
+            elif task.status == "parsing":
+                progress = "解析中..."
+            elif task.status == "pending":
+                progress = "待解析"
+            else:
+                progress = "—"
+
+            self.queue_tree.insert("", "end", iid=str(i),
+                                    values=(icon, title, progress))
+
+        count = len(self.download_queue)
+        self.queue_title_label.configure(text=f"下载队列 ({count})")
+
+        # 显示/隐藏队列区域
+        if count > 0 and not self.queue_frame.winfo_ismapped():
+            self.queue_frame.pack(fill=tk.X, pady=(0, PAD_STD))
+        elif count == 0 and self.queue_frame.winfo_ismapped():
+            self.queue_frame.pack_forget()
+
+        self._canvas.configure(scrollregion=self._canvas.bbox("all"))
+
+    def _remove_from_queue(self, idx: int):
+        """从队列中删除指定任务"""
+        if 0 <= idx < len(self.download_queue):
+            task = self.download_queue[idx]
+            if task.status == "downloading":
+                self._update_status("⚠  无法删除正在下载的任务，请先取消", "warning")
+                return
+            del self.download_queue[idx]
+            self._refresh_queue_ui()
+
+    def _clear_completed(self):
+        """清空已完成和失败的任务"""
+        self.download_queue = [
+            t for t in self.download_queue
+            if t.status not in ("completed", "failed", "cancelled")
+        ]
+        self._refresh_queue_ui()
+
+    def _on_queue_select(self, event):
+        """点击队列项 — 预览视频信息"""
+        selection = self.queue_tree.selection()
+        if not selection:
+            return
+        idx = int(selection[0])
+        task = self.download_queue[idx]
+
+        if task.info:
+            self._show_task_info(task)
+
+    def _on_queue_double_click(self, event):
+        """双击队列项 — 显示详情"""
+        self._on_queue_select(event)
+
+    def _on_queue_right_click(self, event):
+        """右键菜单 — 删除/重试"""
+        item = self.queue_tree.identify_row(event.y)
+        if not item:
+            return
+        idx = int(item)
+        task = self.download_queue[idx]
+
+        menu = tk.Menu(self.root, tearoff=0, bg=BG_SECONDARY, fg=TEXT_PRIMARY,
+                       activebackground=ACCENT, activeforeground="#ffffff",
+                       font=(FONT_UI, 9))
+        menu.add_command(label="删除", command=lambda: self._remove_from_queue(idx))
+        if task.status == "failed":
+            menu.add_command(label="重试解析",
+                             command=lambda: self._retry_parse(idx))
+        menu.add_separator()
+        menu.add_command(label="清空已完成", command=self._clear_completed)
+        menu.post(event.x_root, event.y_root)
+
+    def _retry_parse(self, idx: int):
+        """重试解析失败的任务"""
+        task = self.download_queue[idx]
+        task.status = "pending"
+        task.error_msg = ""
+        self._refresh_queue_ui()
+        self._parse_next_in_queue()
+
+    def _show_task_info(self, task: DownloadTask):
+        """在视频信息卡片中显示任务详情"""
+        if not task.info:
+            return
+
+        self.video_info = task.info
+        self.video_formats = task.formats
+
+        self.video_title_label.configure(text=task.title)
         self.video_meta_label.configure(
-            text=f"时长: {self._format_duration(duration)}  ·  "
-                 f"平台: {info.get('extractor_key', '?')}"
-        )
+            text=f"时长: {task.duration}  ·  平台: {task.info.get('extractor_key', '?')}")
         self.video_uploader_label.configure(
-            text=f"上传者: {uploader}" if uploader else ""
-        )
-
-        # 下载缩略图
-        if thumb_url:
-            self._download_thumbnail(thumb_url)
+            text=f"上传者: {task.uploader}" if task.uploader else "")
 
         # 填充格式
-        display_strings = self._populate_formats(info)
-        if display_strings:
-            self.format_combo.configure(values=display_strings)
+        if task.formats:
+            display = []
+            for f in task.formats:
+                h = f["height"]
+                e = f.get("ext", "?")
+                size = f.get("filesize") or f.get("filesize_approx") or 0
+                display.append(f"{h}p ({e})  ~ {self._format_filesize(size)}")
+            self.format_combo.configure(values=display)
             self.format_combo.current(0)
-            self._set_ui_state("ready_to_download")
-            self._update_status(f"✅  解析完成 — {len(display_strings)} 种分辨率可选", "success")
-        else:
-            self._update_status("❌  未找到可下载的格式", "error")
-            self._set_ui_state("ready")
-
-        # 自动检测平台并更新下拉框
-        detected = self._detect_platform(self.url_var.get())
-        if detected and detected in PLATFORM_NAMES:
-            self.platform_var.set(PLATFORM_NAMES[detected])
+            task.format_id = task.formats[0].get("format_id", "")
 
         # 显示信息卡片
-        self.info_frame.pack(
-            before=self.format_frame, fill=tk.X,
-            pady=(0, PAD_STD),
-        )
+        if not self.info_frame.winfo_ismapped():
+            self.info_frame.pack(before=self.format_frame, fill=tk.X,
+                                 pady=(0, PAD_STD))
 
-        # 确保 canvas 滚动区域更新
-        self._canvas.configure(
-            scrollregion=self._canvas.bbox("all"))
+        self._canvas.configure(scrollregion=self._canvas.bbox("all"))
 
-    def _populate_formats(self, info):
+    # ═══════════════════════════════════════════════════════
+    # 格式处理（共享）
+    # ═══════════════════════════════════════════════════════
+
+    def _filter_formats(self, info: dict) -> list:
         """过滤并去重可用格式列表"""
         formats = info.get("formats", [])
         usable = []
@@ -759,7 +857,6 @@ class VideoDownloaderApp:
             ext = f.get("ext", "?")
             key = (height, ext)
             if key in seen:
-                # 保留 filesize 更大的
                 existing = next(x for x in usable if x.get("key") == key)
                 existing_size = existing.get("filesize") or existing.get("filesize_approx") or 0
                 new_size = f.get("filesize") or f.get("filesize_approx") or 0
@@ -774,60 +871,8 @@ class VideoDownloaderApp:
             f_copy["key"] = key
             usable.append(f_copy)
 
-        # 按高度降序排列
         usable.sort(key=lambda x: x.get("height", 0), reverse=True)
-
-        self.video_formats = usable
-
-        # 构建显示字符串
-        display = []
-        for f in usable:
-            h = f["height"]
-            e = f.get("ext", "?")
-            size = f.get("filesize") or f.get("filesize_approx") or 0
-            display.append(f"{h}p ({e})  ~ {self._format_filesize(size)}")
-
-        return display
-
-    def _download_thumbnail(self, url):
-        """下载缩略图到临时文件并显示"""
-        try:
-            import urllib.request
-            import urllib.parse
-
-            parsed = urllib.parse.urlparse(url)
-            suffix = os.path.splitext(parsed.path)[1] or ".jpg"
-            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
-            tmp_path = tmp.name
-            tmp.close()
-
-            urllib.request.urlretrieve(url, tmp_path)
-
-            # 清理旧缩略图
-            if self._thumb_path and os.path.isfile(self._thumb_path):
-                try:
-                    os.unlink(self._thumb_path)
-                except Exception:
-                    pass
-
-            self._thumb_path = tmp_path
-
-            # 用 tk.PhotoImage 加载（不做 resize，保持简单）
-            img = tk.PhotoImage(file=tmp_path)
-
-            # 如果宽度 > 240，等比缩小
-            if img.width() > 240:
-                scale = 240 / img.width()
-                img = img.subsample(
-                    max(1, int(1 / scale)),
-                    max(1, int(1 / scale)),
-                )
-
-            self.thumbnail_img = img  # 保持引用防 GC
-            self.thumb_label.configure(image=img)
-        except Exception:
-            # 缩略图失败不阻塞主流程
-            pass
+        return usable
 
     # ═══════════════════════════════════════════════════════
     # 保存路径
@@ -838,76 +883,134 @@ class VideoDownloaderApp:
         current = self.save_path_var.get()
         if not os.path.isdir(current):
             current = os.path.expanduser("~\\Downloads")
-        path = filedialog.askdirectory(
-            title="选择保存位置",
-            initialdir=current,
-        )
+        path = filedialog.askdirectory(title="选择保存位置", initialdir=current)
         if path:
             self.save_path_var.set(path)
 
     # ═══════════════════════════════════════════════════════
-    # 下载
+    # 单视频下载（保留兼容）
     # ═══════════════════════════════════════════════════════
 
-    def _start_download(self):
-        """开始下载"""
-        url = self.url_var.get().strip()
+    def _start_single_download(self):
+        """单视频模式：从解析的 info 下载（兼容旧行为）"""
+        url = self._get_urls_from_text()
+        url = url[0] if url else ""
+
         save_path = self.save_path_var.get().strip()
         fmt_idx = self.format_combo.current()
 
-        # 验证
         if not url:
             self._update_status("⚠  请输入视频链接", "warning")
             return
         if not self.video_formats or fmt_idx < 0:
-            self._update_status("⚠  请先解析视频链接", "warning")
+            self._update_status("⚠  请先解析视频链接（点击队列中的任务）", "warning")
             return
-        if not save_path:
+        if not save_path or not os.path.isdir(save_path):
             self._update_status("⚠  请选择保存位置", "warning")
             return
-        if not os.path.isdir(save_path):
-            self._update_status("⚠  保存路径不存在", "warning")
+
+        # 创建单任务
+        task = DownloadTask(url=url, status="downloading")
+        if self.video_info:
+            task.info = self.video_info
+            task.title = self.video_info.get("title", "")
+            task.formats = self.video_formats
+        task.format_id = self.video_formats[fmt_idx].get("format_id", "")
+
+        self._current_task = task
+        self._batch_mode = False
+
+        self._start_task_download(task)
+
+    # ═══════════════════════════════════════════════════════
+    # 批量下载引擎
+    # ═══════════════════════════════════════════════════════
+
+    def _start_all_downloads(self):
+        """批量模式入口：逐个下载队列中的任务"""
+        # 收集所有 queued 任务
+        ready = [t for t in self.download_queue if t.status == "queued"]
+        if not ready:
+            self._update_status("⚠  队列中没有待下载的任务", "warning")
             return
 
-        selected_format = self.video_formats[fmt_idx]
-        format_id = selected_format.get("format_id", "")
+        save_path = self.save_path_var.get().strip()
+        if not save_path or not os.path.isdir(save_path):
+            self._update_status("⚠  请选择保存位置", "warning")
+            return
 
-        # 切换 UI
+        self._batch_mode = True
+        self._update_status(f"⬇  开始批量下载 ({len(ready)} 个视频)...", "progress")
+        self._process_next()
+
+    def _process_next(self):
+        """处理队列中下一个待下载任务"""
+        # 找第一个 queued 任务
+        for task in self.download_queue:
+            if task.status == "queued":
+                self._current_task = task
+                self._start_task_download(task)
+                return
+
+        # 全部完成
+        self._batch_mode = False
+        self._current_task = None
+        completed = sum(1 for t in self.download_queue if t.status == "completed")
+        failed = sum(1 for t in self.download_queue if t.status == "failed")
+        self._update_status(f"✅  批量下载完成 — 成功 {completed} / 失败 {failed}", "success")
+        self._set_ui_state("ready")
+        self.download_btn.configure(state="normal")
+        self._hide_progress()
+
+    def _start_task_download(self, task: DownloadTask):
+        """对单个 task 启动下载"""
+        task.status = "downloading"
+        task.progress = 0.0
         self.downloading = True
         self.cancel_requested = False
-        self._set_ui_state("downloading")
-        self.download_btn.configure(text="取消下载", style="Danger.TButton",
-                                     command=self._cancel_download)
 
-        # 显示进度区（放在下载按钮之前）
-        self.progress_frame.pack_forget()
-        btn_parent = self.download_btn.master
-        self.progress_frame.pack(
-            before=self.download_btn, fill=tk.X,
-            pady=(0, PAD_STD),
-        )
+        self._refresh_queue_ui()
+        self._set_ui_state("downloading")
+
+        # 显示进度区域
+        self._show_progress()
 
         self.progress_bar["value"] = 0
         self.pct_label.configure(text="0%")
         self.speed_label.configure(text="速度: --")
         self.eta_label.configure(text="剩余: --")
 
-        self._update_status("⬇  正在下载...", "progress")
+        task_label = task.title or task.url[:50]
+        self._update_status(f"⬇  正在下载: {task_label}", "progress")
 
-        # 启动下载线程
+        save_path = self.save_path_var.get().strip()
+        format_id = task.format_id
+
+        # 如果 task 没有 format_id，用最佳默认值
+        if not format_id and task.formats:
+            format_id = task.formats[0].get("format_id", "best")
+        if not format_id:
+            format_id = "best"
+
         threading.Thread(
             target=self._download_thread,
-            args=(url, format_id, save_path),
+            args=(task.url, format_id, save_path),
             daemon=True,
         ).start()
 
-        # 开始轮询进度
         self._poll_progress()
 
-    def _cancel_download(self):
-        """取消下载"""
-        self.cancel_requested = True
-        self._update_status("⏹  正在取消...", "warning")
+    def _cancel_all_downloads(self):
+        """取消当前下载（批量模式下停止队列）"""
+        if self.downloading:
+            self.cancel_requested = True
+            # 把剩余 queued 标记为 cancelled
+            for task in self.download_queue:
+                if task.status == "queued":
+                    task.status = "cancelled"
+            self._update_status("⏹  正在取消...", "warning")
+        else:
+            self._update_status("⏹  没有正在进行的下载", "info")
 
     def _download_thread(self, url, format_id, save_path):
         """后台下载线程"""
@@ -958,25 +1061,23 @@ class VideoDownloaderApp:
                 status = data.get("status", "")
 
                 if status == "finished":
-                    self._on_download_complete(data)
+                    self._on_task_done(data)
                     return
                 elif status == "error":
-                    self._on_download_error(data)
+                    self._on_task_error(data)
                     return
                 elif status == "cancelled":
-                    self._on_download_cancelled()
+                    self._on_task_cancelled()
                     return
                 else:
                     self._update_progress_ui(data)
         except queue.Empty:
             pass
 
-        # 继续轮询
         self._poll_after_id = self.root.after(100, self._poll_progress)
 
     def _update_progress_ui(self, data):
         """更新进度条和标签"""
-        # 解析百分比
         pct_str = data.get("percent_str", "0%")
         try:
             pct = float(pct_str.replace("%", "").strip())
@@ -986,62 +1087,104 @@ class VideoDownloaderApp:
         self.progress_bar["value"] = pct
         self.pct_label.configure(text=f"{pct:.1f}%")
 
-        # 速度
         speed = data.get("speed_str", "N/A").strip()
         if speed and speed != "N/A":
             self.speed_label.configure(text=f"速度: {speed}")
 
-        # ETA
         eta = data.get("eta_str", "N/A").strip()
         if eta and eta != "N/A":
             self.eta_label.configure(text=f"剩余: {eta}")
+
+        # 更新当前任务和 Treeview
+        if self._current_task:
+            self._current_task.progress = pct
+            self._current_task.speed = speed
+            self._current_task.eta = eta
+            self._refresh_queue_ui()
+
+    def _on_task_done(self, data):
+        """单个任务下载完成"""
+        self.downloading = False
+
+        task = self._current_task
+        if task:
+            task.status = "completed"
+            task.progress = 100.0
+            task.filepath = data.get("filename", "")
+
+            basename = os.path.basename(task.filepath) if task.filepath else "未知"
+            self._update_status(f"✅  完成: {basename}", "success")
+            self._add_to_history(task.title or task.url, task.filepath)
+
+        self._refresh_queue_ui()
+
+        if self._batch_mode:
+            # 继续下一个
+            self.root.after(300, self._process_next)
         else:
-            self.eta_label.configure(text="剩余: --")
+            # 单视频模式
+            self._current_task = None
+            self._set_ui_state("ready")
+            self.download_btn.configure(state="normal")
+            self.progress_bar["value"] = 100
+            self.pct_label.configure(text="100%")
 
-    def _on_download_complete(self, data):
-        """下载完成"""
+    def _on_task_error(self, data):
+        """单个任务下载失败"""
         self.downloading = False
-        self.download_btn.configure(text="⬇  开始下载", style="Accent.TButton",
-                                     command=self._start_download)
-        self._set_ui_state("ready_to_download")
 
-        filename = data.get("filename", "")
-        basename = os.path.basename(filename) if filename else "未知文件"
-        self._update_status(f"✅  下载完成: {basename}", "success")
+        task = self._current_task
+        if task:
+            task.status = "failed"
+            msg = data.get("message", "未知错误")
+            if "Permission denied" in msg:
+                msg = "写入权限不足"
+            elif "No space" in msg:
+                msg = "磁盘空间不足"
+            elif "connection" in msg.lower():
+                msg = "网络连接中断"
+            task.error_msg = msg
+            self._update_status(f"❌  失败: {task.error_msg}", "error")
 
-        # 添加到历史
-        title = self.video_info.get("title", "未知") if self.video_info else "未知"
-        self._add_to_history(title, filename)
+        self._refresh_queue_ui()
 
-        # 清理进度条
-        self.progress_bar["value"] = 100
-        self.pct_label.configure(text="100%")
+        if self._batch_mode:
+            self.root.after(300, self._process_next)
+        else:
+            self._current_task = None
+            self._set_ui_state("ready")
+            self.download_btn.configure(state="normal")
 
-    def _on_download_error(self, data):
-        """下载失败"""
-        self.downloading = False
-        self.download_btn.configure(text="⬇  开始下载", style="Accent.TButton",
-                                     command=self._start_download)
-        self._set_ui_state("ready_to_download")
-
-        msg = data.get("message", "未知错误")
-        # 简化常见错误
-        if "Permission denied" in msg or "PermissionError" in msg:
-            msg = "写入权限不足，请更换保存位置"
-        elif "No space" in msg or "disk" in msg.lower():
-            msg = "磁盘空间不足"
-        elif "connection" in msg.lower():
-            msg = "网络连接中断"
-
-        self._update_status(f"❌  下载失败: {msg}", "error")
-
-    def _on_download_cancelled(self):
+    def _on_task_cancelled(self):
         """下载已取消"""
         self.downloading = False
-        self.download_btn.configure(text="⬇  开始下载", style="Accent.TButton",
-                                     command=self._start_download)
-        self._set_ui_state("ready_to_download")
+
+        task = self._current_task
+        if task:
+            task.status = "cancelled"
+
+        self._refresh_queue_ui()
+
+        if self._batch_mode:
+            self.root.after(300, self._process_next)
+        else:
+            self._current_task = None
+            self._set_ui_state("ready")
+            self.download_btn.configure(state="normal")
+
         self._update_status("⏹  下载已取消", "info")
+
+    def _show_progress(self):
+        """显示进度区域"""
+        self.progress_frame.pack_forget()
+        self.progress_frame.pack(before=self.dl_btn_frame, fill=tk.X,
+                                  pady=(0, PAD_STD))
+        self._canvas.configure(scrollregion=self._canvas.bbox("all"))
+
+    def _hide_progress(self):
+        """隐藏进度区域"""
+        self.progress_frame.pack_forget()
+        self._canvas.configure(scrollregion=self._canvas.bbox("all"))
 
     # ═══════════════════════════════════════════════════════
     # UI 状态管理
@@ -1051,43 +1194,45 @@ class VideoDownloaderApp:
         """集中控制各控件的状态"""
         states = {
             "ready": {
-                "url": "normal", "paste": "normal", "platform": "readonly",
+                "url": "normal", "paste": "normal", "add_queue": "normal",
+                "clear_url": "normal", "platform": "readonly",
                 "format": "disabled", "save": "normal", "browse": "normal",
-                "download": "disabled",
+                "download": "disabled", "batch_dl": "normal",
             },
             "parsing": {
-                "url": "normal", "paste": "normal", "platform": "readonly",
+                "url": "normal", "paste": "normal", "add_queue": "disabled",
+                "clear_url": "normal", "platform": "readonly",
                 "format": "disabled", "save": "normal", "browse": "normal",
-                "download": "disabled",
+                "download": "disabled", "batch_dl": "disabled",
             },
             "ready_to_download": {
-                "url": "normal", "paste": "normal", "platform": "readonly",
+                "url": "normal", "paste": "normal", "add_queue": "normal",
+                "clear_url": "normal", "platform": "readonly",
                 "format": "readonly", "save": "normal", "browse": "normal",
-                "download": "normal",
+                "download": "normal", "batch_dl": "normal",
             },
             "downloading": {
-                "url": "disabled", "paste": "disabled", "platform": "disabled",
+                "url": "disabled", "paste": "disabled", "add_queue": "disabled",
+                "clear_url": "disabled", "platform": "disabled",
                 "format": "disabled", "save": "disabled", "browse": "disabled",
-                "download": "normal",  # 按钮变为取消
+                "download": "disabled", "batch_dl": "disabled",
             },
         }
 
         s = states.get(state, states["ready"])
         try:
-            self.url_entry.configure(state=s["url"])
+            self.url_text.configure(state=s["url"])
             self.paste_btn.configure(state=s["paste"])
+            self.add_queue_btn.configure(state=s["add_queue"])
+            self.clear_url_btn.configure(state=s["clear_url"])
             self.platform_combo.configure(state=s["platform"])
             self.format_combo.configure(state=s["format"])
             self.save_entry.configure(state=s["save"])
             self.browse_btn.configure(state=s["browse"])
-
-            if state != "downloading":
-                if s["download"] == "normal":
-                    self.download_btn.configure(state="normal")
-                else:
-                    self.download_btn.configure(state="disabled")
+            self.download_btn.configure(state=s["download"])
+            self.batch_download_btn.configure(state=s["batch_dl"])
+            self.cancel_queue_btn.configure(state=s["batch_dl"])
         except tk.TclError:
-            # Widget 可能已被销毁
             pass
 
     def _update_status(self, text, status_type="info"):
@@ -1117,16 +1262,13 @@ class VideoDownloaderApp:
             "time": datetime.now().strftime("%Y-%m-%d %H:%M"),
         }
         self.download_history.insert(0, entry)
-
         display = f"{entry['time']}  ·  {title}"
         self.history_listbox.insert(0, display)
 
-        # 最多保留 50 条
         if len(self.download_history) > 50:
             self.download_history.pop()
             self.history_listbox.delete(tk.END)
 
-        # 显示历史区域
         if not self.history_frame.winfo_ismapped():
             self.history_frame.pack(fill=tk.X, pady=(0, 0))
 
@@ -1144,7 +1286,6 @@ class VideoDownloaderApp:
 
     @staticmethod
     def _format_filesize(bytes_val):
-        """字节 -> 人类可读"""
         if not bytes_val or bytes_val <= 0:
             return "未知大小"
         if bytes_val < 1024:
@@ -1158,7 +1299,6 @@ class VideoDownloaderApp:
 
     @staticmethod
     def _format_duration(seconds):
-        """秒 -> HH:MM:SS 或 MM:SS"""
         if not seconds or seconds <= 0:
             return "?"
         m, s = divmod(int(seconds), 60)
@@ -1169,11 +1309,8 @@ class VideoDownloaderApp:
 
     @staticmethod
     def _check_ffmpeg():
-        """检测 ffmpeg 是否可用"""
-        # PATH
         if shutil.which("ffmpeg"):
             return True
-        # 常见路径
         common = [
             os.path.expandvars(r"%LOCALAPPDATA%\ffmpeg\bin\ffmpeg.exe"),
             os.path.expandvars(r"%ProgramFiles%\ffmpeg\bin\ffmpeg.exe"),
@@ -1183,26 +1320,26 @@ class VideoDownloaderApp:
         for p in common:
             if os.path.isfile(p):
                 return True
-        # 尝试运行
         try:
-            subprocess.run(
-                ["ffmpeg", "-version"],
-                capture_output=True,
-                timeout=5,
-            )
+            subprocess.run(["ffmpeg", "-version"], capture_output=True, timeout=5)
             return True
         except Exception:
             return False
+
+    def _detect_platform(self, url):
+        url_lower = url.lower()
+        for platform, pattern in PLATFORM_PATTERNS.items():
+            if re.search(pattern, url_lower):
+                return platform
+        return None
 
     # ═══════════════════════════════════════════════════════
     # 生命周期
     # ═══════════════════════════════════════════════════════
 
     def _on_close(self):
-        """窗口关闭"""
         if self.downloading:
             self.cancel_requested = True
-        # 清理临时缩略图
         if self._thumb_path and os.path.isfile(self._thumb_path):
             try:
                 os.unlink(self._thumb_path)
@@ -1211,7 +1348,6 @@ class VideoDownloaderApp:
         self.root.destroy()
 
     def run(self):
-        """启动应用"""
         self.root.mainloop()
 
 
